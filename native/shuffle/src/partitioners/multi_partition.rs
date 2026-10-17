@@ -503,10 +503,7 @@ impl<T: PartitionWriter> MultiPartitionShuffleRepartitioner<T> {
             // shuffled batches.
             let indices = &mut partition_indices[partition_id];
             let before_size = indices.allocated_size();
-            indices.reserve(row_indices.len());
-            for row_idx in row_indices {
-                indices.push((buffered_partition_idx, *row_idx));
-            }
+            indices.extend(row_indices.iter().map(|&r| (buffered_partition_idx, r)));
             let after_size = indices.allocated_size();
             mem_growth += after_size.saturating_sub(before_size);
         }
