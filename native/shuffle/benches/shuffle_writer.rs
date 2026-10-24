@@ -16,7 +16,10 @@
 // under the License.
 
 use arrow::array::builder::{Date32Builder, Decimal128Builder, Int32Builder};
-use arrow::array::{builder::StringBuilder, Array, Int32Array, RecordBatch};
+use arrow::array::{
+    builder::StringBuilder, Array, Date32Array, Decimal128Array, Int32Array, RecordBatch,
+    StringArray,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::row::{RowConverter, SortField};
 use criterion::{criterion_group, criterion_main, BatchSize, Bencher, Criterion};
@@ -186,6 +189,34 @@ fn criterion_benchmark(c: &mut Criterion) {
         );
     }
     high_partition_group.finish();
+
+    // A wide schema: the four-column end-to-end benches spend their time in a handful of
+    // arrays, so per-column costs barely register in them. Here every stage that walks the
+    // columns does so 120 times per batch: the memory accounting on insert, the row gather out
+    // of the partition index, IPC encoding and LZ4 compression. Partitioning hashes only the
+    // leading column, so the cost that grows with width is the writer's, not the hash's.
+    // Each batch is built separately: clones would share buffers, which the reservation
+    // charges once, and would hand the gather one cache-resident batch over and over.
+    // Few samples: each iteration shuffles about 120 MB of input.
+    let mut wide_schema_group = c.benchmark_group("shuffle_writer_wide_schema");
+    wide_schema_group.sample_size(10);
+    const WIDE_COLUMNS: usize = 120;
+    wide_schema_group.bench_function(
+        format!(
+            "shuffle_writer: end to end (columns={WIDE_COLUMNS}, partitioning=Hash, compression=Lz4Frame)"
+        ),
+        |b| {
+            bench_end_to_end(b, || {
+                create_shuffle_writer_exec_with(
+                    CompressionCodec::Lz4Frame,
+                    CometPartitioning::Hash(vec![Arc::new(Column::new("c0", 0))], 16),
+                    10,
+                    |i| wide_batch_from(i * 8192, 8192, WIDE_COLUMNS),
+                )
+            })
+        },
+    );
+    wide_schema_group.finish();
 }
 
 /// Times one execution of a freshly built writer per iteration. A `ShuffleWriterExec`
@@ -210,7 +241,23 @@ fn create_shuffle_writer_exec(
     rows_per_batch: usize,
     num_batches: usize,
 ) -> ShuffleWriterExec {
-    let batches = create_batches(rows_per_batch, num_batches);
+    let batch = create_batch(rows_per_batch, true);
+    create_shuffle_writer_exec_with(compression_codec, partitioning, num_batches, |_| {
+        batch.clone()
+    })
+}
+
+/// [`create_shuffle_writer_exec`] over `num_batches` batches that `make_batch` builds from
+/// their index. The plain variant hands every batch out as a clone of one, which shares its
+/// buffers; a fixture that cares about memory accounting or hash spread builds each batch
+/// separately here instead.
+fn create_shuffle_writer_exec_with(
+    compression_codec: CompressionCodec,
+    partitioning: CometPartitioning,
+    num_batches: usize,
+    make_batch: impl Fn(usize) -> RecordBatch,
+) -> ShuffleWriterExec {
+    let batches = (0..num_batches).map(make_batch).collect::<Vec<_>>();
     let schema = batches[0].schema();
     let partitions = &[batches];
     ShuffleWriterExec::try_new(
@@ -225,15 +272,6 @@ fn create_shuffle_writer_exec(
         None,
     )
     .unwrap()
-}
-
-fn create_batches(size: usize, count: usize) -> Vec<RecordBatch> {
-    let batch = create_batch(size, true);
-    let mut batches = Vec::new();
-    for _ in 0..count {
-        batches.push(batch.clone());
-    }
-    batches
 }
 
 fn create_batch(num_rows: usize, allow_nulls: bool) -> RecordBatch {
@@ -273,6 +311,43 @@ fn create_batch_from(first_row: usize, num_rows: usize, allow_nulls: bool) -> Re
         vec![Arc::new(a), Arc::new(b), Arc::new(c), Arc::new(d)],
     )
     .unwrap()
+}
+
+/// `num_cols` nullable columns cycling through the four types of [`create_batch_from`]: Int32,
+/// Utf8, Date32 and Decimal128(11, 2). Every value depends on its row and its column, so no two
+/// columns are copies of each other and the leading Int32 column, which the wide-schema bench
+/// hashes on, is distinct on every row. Every tenth string is null, as in `create_batch_from`.
+fn wide_batch_from(first_row: usize, num_rows: usize, num_cols: usize) -> RecordBatch {
+    let rows = first_row..first_row + num_rows;
+    let (fields, columns): (Vec<Field>, Vec<Arc<dyn Array>>) = (0..num_cols)
+        .map(|col| {
+            let column: Arc<dyn Array> = match col % 4 {
+                0 => Arc::new(Int32Array::from_iter_values(
+                    rows.clone().map(|i| (i + col) as i32),
+                )),
+                1 => Arc::new(
+                    rows.clone()
+                        .map(|i| (i % 10 != 0).then(|| format!("column {col} string {i}")))
+                        .collect::<StringArray>(),
+                ),
+                2 => Arc::new(Date32Array::from_iter_values(
+                    rows.clone().map(|i| (i + col) as i32),
+                )),
+                _ => Arc::new(
+                    Decimal128Array::from_iter_values(
+                        rows.clone().map(|i| (i * 1000 + col) as i128),
+                    )
+                    .with_precision_and_scale(11, 2)
+                    .unwrap(),
+                ),
+            };
+            (
+                Field::new(format!("c{col}"), column.data_type().clone(), true),
+                column,
+            )
+        })
+        .unzip();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
 }
 
 /// Round robin placement in isolation, and then the gather it implies on flush.
