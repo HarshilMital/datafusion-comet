@@ -22,12 +22,13 @@ use arrow::row::{RowConverter, SortField};
 use criterion::{criterion_group, criterion_main, BatchSize, Bencher, Criterion};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::source::DataSourceExec;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_expr::expressions::{col, Column};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::metrics::Time;
 use datafusion::{
     physical_plan::{common::collect, ExecutionPlan},
-    prelude::SessionContext,
+    prelude::{SessionConfig, SessionContext},
 };
 use datafusion_comet_shuffle::{
     bench_support::BenchRepartitioner, CometPartitioning, CompressionCodec, RoundRobinStrategy,
@@ -186,22 +187,88 @@ fn criterion_benchmark(c: &mut Criterion) {
         );
     }
     high_partition_group.finish();
+
+    // The same end-to-end write under a memory limit small enough that the buffered input does
+    // not fit, so the writer spills partway through and copies the spilled blocks back into the
+    // data file as it finishes each partition, as a memory-starved executor does. Every other
+    // end-to-end bench runs on an unbounded pool and never takes that path. The batches are
+    // built separately because the reservation charges a shared buffer once: ten clones of one
+    // batch would look like one batch to it and barely spill at all. Lz4Frame because spill
+    // blocks go through the same codec as the final output. Before timing, one run asserts that
+    // the plan spilled, so a change in the accounting cannot silently turn this into the
+    // unbounded case.
+    const SPILL_MEMORY_LIMIT: usize = 2 * 1024 * 1024;
+    let spill_ctx = SessionContext::new_with_config_rt(
+        SessionConfig::new(),
+        Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_limit(SPILL_MEMORY_LIMIT, 1.0)
+                .build()
+                .unwrap(),
+        ),
+    );
+    let make_spilling_exec = || {
+        create_shuffle_writer_exec_with(
+            CompressionCodec::Lz4Frame,
+            CometPartitioning::Hash(vec![Arc::new(Column::new("c0", 0))], 16),
+            10,
+            |i| create_batch_from(i * 8192, 8192, true),
+        )
+    };
+    let mut spill_group = c.benchmark_group("shuffle_writer_spill");
+    spill_group.sample_size(10);
+    // Checked inside the routine, so only a run that selects this bench pays for the extra
+    // execution, and only once: Criterion calls the routine repeatedly to warm up and sample.
+    let mut checked_spill = false;
+    spill_group.bench_function(
+        format!(
+            "shuffle_writer: end to end (memory_limit={}MiB, partitioning=Hash, compression=Lz4Frame)",
+            SPILL_MEMORY_LIMIT >> 20
+        ),
+        |b| {
+            if !checked_spill {
+                let exec = make_spilling_exec();
+                execute_to_completion(&exec, &spill_ctx);
+                let spill_count = exec
+                    .metrics()
+                    .and_then(|metrics| metrics.spill_count())
+                    .unwrap_or(0);
+                assert!(
+                    spill_count > 0,
+                    "the spill bench must spill under a {SPILL_MEMORY_LIMIT}-byte limit"
+                );
+                checked_spill = true;
+            }
+            bench_end_to_end_in(b, &spill_ctx, make_spilling_exec)
+        },
+    );
+    spill_group.finish();
 }
 
 /// Times one execution of a freshly built writer per iteration. A `ShuffleWriterExec`
 /// publishes its partition offsets once, so it cannot be re-executed; building it is
 /// setup and stays outside the measurement.
 fn bench_end_to_end(b: &mut Bencher, make_exec: impl Fn() -> ShuffleWriterExec) {
-    let ctx = SessionContext::new();
+    bench_end_to_end_in(b, &SessionContext::new(), make_exec)
+}
+
+/// [`bench_end_to_end`] in the caller's session, such as one whose runtime limits memory.
+fn bench_end_to_end_in(
+    b: &mut Bencher,
+    ctx: &SessionContext,
+    make_exec: impl Fn() -> ShuffleWriterExec,
+) {
     b.iter_batched(
         make_exec,
-        |exec| {
-            let stream = exec.execute(0, ctx.task_ctx()).unwrap();
-            let rt = Runtime::new().unwrap();
-            rt.block_on(collect(stream)).unwrap();
-        },
+        |exec| execute_to_completion(&exec, ctx),
         BatchSize::LargeInput,
     );
+}
+
+fn execute_to_completion(exec: &ShuffleWriterExec, ctx: &SessionContext) {
+    let stream = exec.execute(0, ctx.task_ctx()).unwrap();
+    let rt = Runtime::new().unwrap();
+    rt.block_on(collect(stream)).unwrap();
 }
 
 fn create_shuffle_writer_exec(
@@ -210,7 +277,23 @@ fn create_shuffle_writer_exec(
     rows_per_batch: usize,
     num_batches: usize,
 ) -> ShuffleWriterExec {
-    let batches = create_batches(rows_per_batch, num_batches);
+    let batch = create_batch(rows_per_batch, true);
+    create_shuffle_writer_exec_with(compression_codec, partitioning, num_batches, |_| {
+        batch.clone()
+    })
+}
+
+/// [`create_shuffle_writer_exec`] over `num_batches` batches that `make_batch` builds from
+/// their index. The plain variant hands every batch out as a clone of one, which shares its
+/// buffers; a fixture that cares about memory accounting or hash spread builds each batch
+/// separately here instead.
+fn create_shuffle_writer_exec_with(
+    compression_codec: CompressionCodec,
+    partitioning: CometPartitioning,
+    num_batches: usize,
+    make_batch: impl Fn(usize) -> RecordBatch,
+) -> ShuffleWriterExec {
+    let batches = (0..num_batches).map(make_batch).collect::<Vec<_>>();
     let schema = batches[0].schema();
     let partitions = &[batches];
     ShuffleWriterExec::try_new(
@@ -225,15 +308,6 @@ fn create_shuffle_writer_exec(
         None,
     )
     .unwrap()
-}
-
-fn create_batches(size: usize, count: usize) -> Vec<RecordBatch> {
-    let batch = create_batch(size, true);
-    let mut batches = Vec::new();
-    for _ in 0..count {
-        batches.push(batch.clone());
-    }
-    batches
 }
 
 fn create_batch(num_rows: usize, allow_nulls: bool) -> RecordBatch {
