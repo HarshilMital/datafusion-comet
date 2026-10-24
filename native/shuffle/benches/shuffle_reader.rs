@@ -16,8 +16,8 @@
 // under the License.
 
 //! Shuffle read benchmarks: the per-block schema parse measured against a full block decode,
-//! across column counts, rows per block, the default codec and no codec, and a dictionary-encoded
-//! string column.
+//! across column counts, rows per block, every shuffle codec and no codec, and a
+//! dictionary-encoded string column.
 
 use arrow::array::{ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
@@ -66,6 +66,10 @@ fn schema_of(num_columns: usize, strings: Strings) -> SchemaRef {
     ))
 }
 
+/// A batch of [`schema_of`]. Every value depends on its row and its column, so no column is a
+/// copy of another. Identical columns would let a codec encode all but the first as references
+/// to it (zstd at any size, lz4 and snappy wherever a column fits in their window), and the wide
+/// shapes would time copying matches instead of decompressing data.
 fn batch_of(num_columns: usize, num_rows: usize, strings: Strings) -> RecordBatch {
     let schema = schema_of(num_columns, strings);
     let columns = (0..num_columns)
@@ -73,20 +77,21 @@ fn batch_of(num_columns: usize, num_rows: usize, strings: Strings) -> RecordBatc
             if i % 2 == 0 {
                 Arc::new(
                     (0..num_rows)
-                        .map(|r| Some(r as i64))
+                        .map(|r| Some((r * num_columns + i) as i64))
                         .collect::<Int64Array>(),
                 ) as ArrayRef
             } else {
                 match strings {
                     Strings::Plain => Arc::new(
                         (0..num_rows)
-                            .map(|r| Some(format!("value_{r}")))
+                            .map(|r| Some(format!("value_{}", r * num_columns + i)))
                             .collect::<StringArray>(),
                     ) as ArrayRef,
-                    // a small dictionary that every row's key points into
+                    // a small dictionary, its own per column, that every row's key points into
                     Strings::Dictionary => {
-                        let values: Vec<String> =
-                            (0..num_rows).map(|r| format!("value_{}", r % 16)).collect();
+                        let values: Vec<String> = (0..num_rows)
+                            .map(|r| format!("value_{i}_{}", r % 16))
+                            .collect();
                         Arc::new(
                             values
                                 .iter()
@@ -116,10 +121,15 @@ fn encode_block(batch: &RecordBatch, codec: CompressionCodec) -> Vec<u8> {
 fn criterion_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("shuffle_reader");
 
-    // Lz4Frame is the default codec; None isolates the decode from decompression.
-    for (codec_name, codec) in [
-        ("none", CompressionCodec::None),
-        ("lz4", CompressionCodec::Lz4Frame),
+    // Lz4Frame is the default codec; None isolates the decode from decompression. Zstd and
+    // Snappy are the other codecs a shuffle can be configured with, and `read_ipc_compressed`
+    // decompresses each through its own reader, so a change to one of them moves only its rows.
+    // `wide` marks the codecs that also run the 8,000-column case below.
+    for (codec_name, codec, wide) in [
+        ("none", CompressionCodec::None, true),
+        ("lz4", CompressionCodec::Lz4Frame, true),
+        ("zstd", CompressionCodec::Zstd(1), false),
+        ("snappy", CompressionCodec::Snappy, false),
     ] {
         // rows per block shrink as partition count rises, so the small cases stand in for wide
         // shuffles
@@ -133,10 +143,13 @@ fn criterion_benchmark(c: &mut Criterion) {
         }
 
         // This 8,000-column schema uses about 1.4 MiB of the serialized-plus-parsed cache budget.
-        // Compare warm and cold decoding here to catch accidental cache-admission cutoffs.
-        let batch = batch_of(8000, 64, Strings::Plain);
-        let block = encode_block(&batch, codec.clone());
-        bench_block(&mut group, &format!("{codec_name}/8000col_64row"), &block);
+        // Compare warm and cold decoding here to catch accidental cache-admission cutoffs. The
+        // cutoff does not depend on the codec, so None and the default codec are enough.
+        if wide {
+            let batch = batch_of(8000, 64, Strings::Plain);
+            let block = encode_block(&batch, codec.clone());
+            bench_block(&mut group, &format!("{codec_name}/8000col_64row"), &block);
+        }
 
         // the dictionary batch before every record batch, at a narrow and a wide block
         for num_rows in [64usize, 8192] {
