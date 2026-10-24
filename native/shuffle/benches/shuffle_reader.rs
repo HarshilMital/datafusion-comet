@@ -16,11 +16,12 @@
 // under the License.
 
 //! Shuffle read benchmarks: the per-block schema parse measured against a full block decode,
-//! across column counts, rows per block, the default codec and no codec, and a dictionary-encoded
-//! string column.
+//! across column counts, rows per block, the default codec and no codec, a dictionary-encoded
+//! string column, and list and map columns.
 
+use arrow::array::builder::{Int64Builder, ListBuilder, MapBuilder, StringBuilder};
 use arrow::array::{ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Fields, Int32Type, Schema, SchemaRef};
 use arrow::ipc::reader::StreamReader;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use datafusion::physical_plan::metrics::Time;
@@ -35,28 +36,49 @@ use std::sync::Arc;
 /// 8-byte compressed length plus 8-byte field count; `read_ipc_compressed` expects what follows.
 const BLOCK_HEADER_LEN: usize = 16;
 
-/// How the odd columns hold their strings.
+/// What the odd columns hold.
 #[derive(Clone, Copy)]
-enum Strings {
+enum OddColumns {
+    /// `Utf8`, a distinct string per row.
     Plain,
     /// `Dictionary(Int32, Utf8)`: the block carries a dictionary batch before its record batch,
     /// as the JVM columnar shuffle writes for strings.
     Dictionary,
+    /// `List<Int64>` of 0 to 8 elements, varying by row and column: each column decodes to an
+    /// offsets buffer over a child array.
+    List,
+    /// `Map<Utf8, Int64>` of 1 to 7 entries, varying by row and column: offsets over a struct of
+    /// a string child and an Int64 child.
+    Map,
 }
 
-/// Alternating `Int64` and string columns.
-fn schema_of(num_columns: usize, strings: Strings) -> SchemaRef {
+/// Alternating `Int64` columns and columns of `odd`.
+fn schema_of(num_columns: usize, odd: OddColumns) -> SchemaRef {
     Arc::new(Schema::new(
         (0..num_columns)
             .map(|i| {
                 let data_type = if i % 2 == 0 {
                     DataType::Int64
                 } else {
-                    match strings {
-                        Strings::Plain => DataType::Utf8,
-                        Strings::Dictionary => DataType::Dictionary(
+                    match odd {
+                        OddColumns::Plain => DataType::Utf8,
+                        OddColumns::Dictionary => DataType::Dictionary(
                             Box::new(DataType::Int32),
                             Box::new(DataType::Utf8),
+                        ),
+                        OddColumns::List => {
+                            DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true)))
+                        }
+                        OddColumns::Map => DataType::Map(
+                            Arc::new(Field::new(
+                                "entries",
+                                DataType::Struct(Fields::from(vec![
+                                    Field::new("keys", DataType::Utf8, false),
+                                    Field::new("values", DataType::Int64, true),
+                                ])),
+                                false,
+                            )),
+                            false,
                         ),
                     }
                 };
@@ -66,33 +88,74 @@ fn schema_of(num_columns: usize, strings: Strings) -> SchemaRef {
     ))
 }
 
-fn batch_of(num_columns: usize, num_rows: usize, strings: Strings) -> RecordBatch {
-    let schema = schema_of(num_columns, strings);
+/// A list or map length below `max` for row `r` of column `i`. A hash rather than `r % max`, so
+/// that no two columns share a length sequence and with it an identical offsets buffer.
+fn length_of(r: usize, i: usize, max: usize) -> usize {
+    let h = (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (i as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    ((h ^ (h >> 29)) % max as u64) as usize
+}
+
+/// A batch of [`schema_of`]. Every value depends on its row and its column, so no column is a
+/// copy of another. Identical columns would let a codec encode all but the first as references
+/// to it (zstd at any size, lz4 and snappy wherever a column fits in their window), and the wide
+/// shapes would time copying matches instead of decompressing data.
+fn batch_of(num_columns: usize, num_rows: usize, odd: OddColumns) -> RecordBatch {
+    let schema = schema_of(num_columns, odd);
     let columns = (0..num_columns)
         .map(|i| {
             if i % 2 == 0 {
                 Arc::new(
                     (0..num_rows)
-                        .map(|r| Some(r as i64))
+                        .map(|r| Some((r * num_columns + i) as i64))
                         .collect::<Int64Array>(),
                 ) as ArrayRef
             } else {
-                match strings {
-                    Strings::Plain => Arc::new(
+                match odd {
+                    OddColumns::Plain => Arc::new(
                         (0..num_rows)
-                            .map(|r| Some(format!("value_{r}")))
+                            .map(|r| Some(format!("value_{}", r * num_columns + i)))
                             .collect::<StringArray>(),
                     ) as ArrayRef,
-                    // a small dictionary that every row's key points into
-                    Strings::Dictionary => {
-                        let values: Vec<String> =
-                            (0..num_rows).map(|r| format!("value_{}", r % 16)).collect();
+                    // a small dictionary, its own per column, that every row's key points into
+                    OddColumns::Dictionary => {
+                        let values: Vec<String> = (0..num_rows)
+                            .map(|r| format!("value_{i}_{}", r % 16))
+                            .collect();
                         Arc::new(
                             values
                                 .iter()
                                 .map(String::as_str)
                                 .collect::<DictionaryArray<Int32Type>>(),
                         ) as ArrayRef
+                    }
+                    OddColumns::List => {
+                        let mut builder = ListBuilder::new(Int64Builder::new());
+                        for r in 0..num_rows {
+                            for e in 0..length_of(r, i, 9) {
+                                builder
+                                    .values()
+                                    .append_value(((r * 16 + e) * num_columns + i) as i64);
+                            }
+                            builder.append(true);
+                        }
+                        Arc::new(builder.finish()) as ArrayRef
+                    }
+                    OddColumns::Map => {
+                        let mut builder =
+                            MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+                        for r in 0..num_rows {
+                            for e in 0..1 + length_of(r, i, 7) {
+                                builder
+                                    .keys()
+                                    .append_value(format!("c{i}_key_{e}_{}", r % 97));
+                                builder
+                                    .values()
+                                    .append_value(((r * 16 + e) * num_columns + i) as i64);
+                            }
+                            builder.append(true).unwrap();
+                        }
+                        Arc::new(builder.finish()) as ArrayRef
                     }
                 }
             }
@@ -125,7 +188,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         // shuffles
         for num_columns in [5usize, 50] {
             for num_rows in [64usize, 512, 8192] {
-                let batch = batch_of(num_columns, num_rows, Strings::Plain);
+                let batch = batch_of(num_columns, num_rows, OddColumns::Plain);
                 let block = encode_block(&batch, codec.clone());
                 let id = format!("{codec_name}/{num_columns}col_{num_rows}row");
                 bench_block(&mut group, &id, &block);
@@ -134,16 +197,27 @@ fn criterion_benchmark(c: &mut Criterion) {
 
         // This 8,000-column schema uses about 1.4 MiB of the serialized-plus-parsed cache budget.
         // Compare warm and cold decoding here to catch accidental cache-admission cutoffs.
-        let batch = batch_of(8000, 64, Strings::Plain);
+        let batch = batch_of(8000, 64, OddColumns::Plain);
         let block = encode_block(&batch, codec.clone());
         bench_block(&mut group, &format!("{codec_name}/8000col_64row"), &block);
 
         // the dictionary batch before every record batch, at a narrow and a wide block
         for num_rows in [64usize, 8192] {
-            let batch = batch_of(5, num_rows, Strings::Dictionary);
+            let batch = batch_of(5, num_rows, OddColumns::Dictionary);
             let block = encode_block(&batch, codec.clone());
             let id = format!("{codec_name}/5col_{num_rows}row_dict");
             bench_block(&mut group, &id, &block);
+        }
+
+        // list and map columns, which decode to nested array data (offsets over child arrays)
+        // rather than flat arrays, at a narrow and a wide block
+        for (odd, suffix) in [(OddColumns::List, "list"), (OddColumns::Map, "map")] {
+            for num_rows in [64usize, 8192] {
+                let batch = batch_of(5, num_rows, odd);
+                let block = encode_block(&batch, codec.clone());
+                let id = format!("{codec_name}/5col_{num_rows}row_{suffix}");
+                bench_block(&mut group, &id, &block);
+            }
         }
     }
 
@@ -151,7 +225,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     // only applies to uncompressed blocks. A control arm: this change does not touch it.
     for num_columns in [5usize, 50] {
         for num_rows in [64usize, 512, 8192] {
-            let batch = batch_of(num_columns, num_rows, Strings::Plain);
+            let batch = batch_of(num_columns, num_rows, OddColumns::Plain);
             let block = encode_block(&batch, CompressionCodec::None);
             group.bench_with_input(
                 BenchmarkId::new(
