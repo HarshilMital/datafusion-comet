@@ -16,11 +16,12 @@
 // under the License.
 
 //! Shuffle read benchmarks: the per-block schema parse measured against a full block decode,
-//! across column counts, rows per block, the default codec and no codec, and a dictionary-encoded
-//! string column.
+//! across column counts, rows per block, the default codec and no codec, a dictionary-encoded
+//! string column, and small blocks of nested columns.
 
-use arrow::array::{ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
+use arrow::array::builder::{Int64Builder, ListBuilder, StringBuilder, StructBuilder};
+use arrow::array::{ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, StructArray};
+use arrow::datatypes::{DataType, Field, Fields, Int32Type, Schema, SchemaRef};
 use arrow::ipc::reader::StreamReader;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use datafusion::physical_plan::metrics::Time;
@@ -35,29 +36,59 @@ use std::sync::Arc;
 /// 8-byte compressed length plus 8-byte field count; `read_ipc_compressed` expects what follows.
 const BLOCK_HEADER_LEN: usize = 16;
 
-/// How the odd columns hold their strings.
+/// What the odd columns hold.
 #[derive(Clone, Copy)]
-enum Strings {
+enum OddColumns {
+    /// `Utf8`, a distinct string per row.
     Plain,
     /// `Dictionary(Int32, Utf8)`: the block carries a dictionary batch before its record batch,
     /// as the JVM columnar shuffle writes for strings.
     Dictionary,
+    /// `Struct<a: Int64, b: Utf8>` wrapped in [`DEEP_STRUCT_DEPTH`] single-field structs: six
+    /// fields nested under each column for two leaf arrays.
+    DeepStruct,
+    /// `List<Struct<a: Int64, b: Utf8>>` of 0 to 8 entries, varying by row and column.
+    ListOfStruct,
 }
 
-/// Alternating `Int64` and string columns.
-fn schema_of(num_columns: usize, strings: Strings) -> SchemaRef {
+/// How many single-field structs wrap the leaf of an [`OddColumns::DeepStruct`] column.
+const DEEP_STRUCT_DEPTH: usize = 4;
+
+/// The two-field leaf of the nested shapes.
+fn leaf_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("a", DataType::Int64, true),
+        Field::new("b", DataType::Utf8, true),
+    ])
+}
+
+/// Alternating `Int64` columns and columns of `odd`.
+fn schema_of(num_columns: usize, odd: OddColumns) -> SchemaRef {
     Arc::new(Schema::new(
         (0..num_columns)
             .map(|i| {
                 let data_type = if i % 2 == 0 {
                     DataType::Int64
                 } else {
-                    match strings {
-                        Strings::Plain => DataType::Utf8,
-                        Strings::Dictionary => DataType::Dictionary(
+                    match odd {
+                        OddColumns::Plain => DataType::Utf8,
+                        OddColumns::Dictionary => DataType::Dictionary(
                             Box::new(DataType::Int32),
                             Box::new(DataType::Utf8),
                         ),
+                        OddColumns::DeepStruct => (0..DEEP_STRUCT_DEPTH).fold(
+                            DataType::Struct(leaf_fields()),
+                            |inner, level| {
+                                DataType::Struct(Fields::from(vec![Field::new(
+                                    format!("s{level}"),
+                                    inner,
+                                    true,
+                                )]))
+                            },
+                        ),
+                        OddColumns::ListOfStruct => DataType::List(Arc::new(
+                            Field::new_list_field(DataType::Struct(leaf_fields()), true),
+                        )),
                     }
                 };
                 Field::new(format!("column_{i}"), data_type, false)
@@ -66,33 +97,92 @@ fn schema_of(num_columns: usize, strings: Strings) -> SchemaRef {
     ))
 }
 
-fn batch_of(num_columns: usize, num_rows: usize, strings: Strings) -> RecordBatch {
-    let schema = schema_of(num_columns, strings);
+/// A list or map length below `max` for row `r` of column `i`. A hash rather than `r % max`, so
+/// that no two columns share a length sequence and with it an identical offsets buffer.
+fn length_of(r: usize, i: usize, max: usize) -> usize {
+    let h = (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (i as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    ((h ^ (h >> 29)) % max as u64) as usize
+}
+
+/// A batch of [`schema_of`]. Every value depends on its row and its column, so no column is a
+/// copy of another. Identical columns would let a codec encode all but the first as references
+/// to it (zstd at any size, lz4 and snappy wherever a column fits in their window), and the wide
+/// shapes would time copying matches instead of decompressing data.
+fn batch_of(num_columns: usize, num_rows: usize, odd: OddColumns) -> RecordBatch {
+    let schema = schema_of(num_columns, odd);
     let columns = (0..num_columns)
         .map(|i| {
             if i % 2 == 0 {
                 Arc::new(
                     (0..num_rows)
-                        .map(|r| Some(r as i64))
+                        .map(|r| Some((r * num_columns + i) as i64))
                         .collect::<Int64Array>(),
                 ) as ArrayRef
             } else {
-                match strings {
-                    Strings::Plain => Arc::new(
+                match odd {
+                    OddColumns::Plain => Arc::new(
                         (0..num_rows)
-                            .map(|r| Some(format!("value_{r}")))
+                            .map(|r| Some(format!("value_{}", r * num_columns + i)))
                             .collect::<StringArray>(),
                     ) as ArrayRef,
-                    // a small dictionary that every row's key points into
-                    Strings::Dictionary => {
-                        let values: Vec<String> =
-                            (0..num_rows).map(|r| format!("value_{}", r % 16)).collect();
+                    // a small dictionary, its own per column, that every row's key points into
+                    OddColumns::Dictionary => {
+                        let values: Vec<String> = (0..num_rows)
+                            .map(|r| format!("value_{i}_{}", r % 16))
+                            .collect();
                         Arc::new(
                             values
                                 .iter()
                                 .map(String::as_str)
                                 .collect::<DictionaryArray<Int32Type>>(),
                         ) as ArrayRef
+                    }
+                    OddColumns::DeepStruct => {
+                        let leaf: ArrayRef = Arc::new(StructArray::new(
+                            leaf_fields(),
+                            vec![
+                                Arc::new(Int64Array::from_iter_values(
+                                    (0..num_rows).map(|r| (r * num_columns + i) as i64),
+                                )),
+                                Arc::new(
+                                    (0..num_rows)
+                                        .map(|r| Some(format!("value_{}", r * num_columns + i)))
+                                        .collect::<StringArray>(),
+                                ),
+                            ],
+                            None,
+                        ));
+                        (0..DEEP_STRUCT_DEPTH).fold(leaf, |inner, level| {
+                            let field =
+                                Field::new(format!("s{level}"), inner.data_type().clone(), true);
+                            Arc::new(StructArray::new(
+                                Fields::from(vec![field]),
+                                vec![inner],
+                                None,
+                            ))
+                        })
+                    }
+                    OddColumns::ListOfStruct => {
+                        let mut builder =
+                            ListBuilder::new(StructBuilder::from_fields(leaf_fields(), 0));
+                        for r in 0..num_rows {
+                            let entries = builder.values();
+                            for e in 0..length_of(r, i, 9) {
+                                let value = (r * 16 + e) * num_columns + i;
+                                entries
+                                    .field_builder::<Int64Builder>(0)
+                                    .unwrap()
+                                    .append_value(value as i64);
+                                entries
+                                    .field_builder::<StringBuilder>(1)
+                                    .unwrap()
+                                    .append_value(format!("entry_{value}"));
+                                entries.append(true);
+                            }
+                            builder.append(true);
+                        }
+                        Arc::new(builder.finish()) as ArrayRef
                     }
                 }
             }
@@ -125,7 +215,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         // shuffles
         for num_columns in [5usize, 50] {
             for num_rows in [64usize, 512, 8192] {
-                let batch = batch_of(num_columns, num_rows, Strings::Plain);
+                let batch = batch_of(num_columns, num_rows, OddColumns::Plain);
                 let block = encode_block(&batch, codec.clone());
                 let id = format!("{codec_name}/{num_columns}col_{num_rows}row");
                 bench_block(&mut group, &id, &block);
@@ -134,15 +224,29 @@ fn criterion_benchmark(c: &mut Criterion) {
 
         // This 8,000-column schema uses about 1.4 MiB of the serialized-plus-parsed cache budget.
         // Compare warm and cold decoding here to catch accidental cache-admission cutoffs.
-        let batch = batch_of(8000, 64, Strings::Plain);
+        let batch = batch_of(8000, 64, OddColumns::Plain);
         let block = encode_block(&batch, codec.clone());
         bench_block(&mut group, &format!("{codec_name}/8000col_64row"), &block);
 
         // the dictionary batch before every record batch, at a narrow and a wide block
         for num_rows in [64usize, 8192] {
-            let batch = batch_of(5, num_rows, Strings::Dictionary);
+            let batch = batch_of(5, num_rows, OddColumns::Dictionary);
             let block = encode_block(&batch, codec.clone());
             let id = format!("{codec_name}/5col_{num_rows}row_dict");
+            bench_block(&mut group, &id, &block);
+        }
+
+        // Nested schemas at 64 rows: the schema message is large next to the data, so parsing it
+        // should be a large share of a cold decode, and `decode_block` against
+        // `decode_block_uncached` shows what the schema cache saves on nested shapes, not only
+        // on flat ones.
+        for (odd, suffix) in [
+            (OddColumns::DeepStruct, "deep_struct"),
+            (OddColumns::ListOfStruct, "list_struct"),
+        ] {
+            let batch = batch_of(50, 64, odd);
+            let block = encode_block(&batch, codec.clone());
+            let id = format!("{codec_name}/50col_64row_{suffix}");
             bench_block(&mut group, &id, &block);
         }
     }
@@ -151,7 +255,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     // only applies to uncompressed blocks. A control arm: this change does not touch it.
     for num_columns in [5usize, 50] {
         for num_rows in [64usize, 512, 8192] {
-            let batch = batch_of(num_columns, num_rows, Strings::Plain);
+            let batch = batch_of(num_columns, num_rows, OddColumns::Plain);
             let block = encode_block(&batch, CompressionCodec::None);
             group.bench_with_input(
                 BenchmarkId::new(
